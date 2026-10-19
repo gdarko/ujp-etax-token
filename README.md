@@ -33,20 +33,23 @@
 
 | Датотека | Намена |
 | --- | --- |
-| `Install-EDanoci.ps1` | Ги инсталира компонентите, ја применува конфигурацијата и го регистрира watchdog-от. Бара администраторски права. |
-| `Repair-EDanoci.ps1` | Ја проверува и поправа конфигурацијата. Watchdog-от ја извршува копијата во `C:\ProgramData\EDanoci`. |
-| `Fix-TokenIds.ps1`, `Fix-TokenIds.js` | Им дава посебен ID на CA-сертификатите на токенот (`check`, `apply`, `undo`). Без администраторски права. |
+| `scripts/Install-EDanoci.ps1` | Ги инсталира компонентите, ја применува конфигурацијата и го регистрира watchdog-от. Бара администраторски права. |
+| `scripts/Repair-EDanoci.ps1` | Ја проверува и поправа конфигурацијата. Watchdog-от ја извршува копијата во `C:\ProgramData\EDanoci`. |
+| `scripts/Fix-TokenIds.ps1`, `scripts/Fix-TokenIds.js` | Им дава посебен ID на CA-сертификатите на токенот (`check`, `apply`, `undo`). Без администраторски права. |
+| `docs/` | Упатства за одржување, решавање проблеми, измени и безбедност. |
+
+Скриптите се повикуваат меѓусебно, па чувајте ја целата папка `scripts` заедно.
 
 ## Инсталација
 
 Извршете ја `Install-EDanoci.ps1` еднаш со администраторски права за да ги инсталирате и конфигурирате потребните компоненти. Скриптата може безбедно да се изврши повторно: ги прескокнува веќе инсталираните компоненти и повторно ја применува конфигурацијата, па може да послужи и за поправка.
 
-1. Зачувајте ги сите датотеки од табелата погоре во иста папка на компјутерот, на пример во `C:\Tools`. Со Git: `git clone https://github.com/gdarko/ujp-etax-token.git C:\Tools`.
+1. Преземете го репозиториумот на компјутерот, на пример во `C:\Tools`. Со Git: `git clone https://github.com/gdarko/ujp-etax-token.git C:\Tools`. Без Git: на GitHub изберете **Code > Download ZIP** и отпакувајте го во `C:\Tools`. Скриптите се во `C:\Tools\scripts`.
 2. Кликнете со десното копче на Start и отворете **Terminal (Admin)** или **Windows PowerShell (Admin)**.
 3. Извршете ги командите:
 
 ```powershell
-cd C:\Tools
+cd C:\Tools\scripts
 Set-ExecutionPolicy -Scope Process Bypass -Force
 Unblock-File .\Install-EDanoci.ps1, .\Repair-EDanoci.ps1, .\Fix-TokenIds.ps1
 .\Install-EDanoci.ps1
@@ -54,7 +57,7 @@ Unblock-File .\Install-EDanoci.ps1, .\Repair-EDanoci.ps1, .\Fix-TokenIds.ps1
 
 4. На крајот проверете ја табелата **Verification**. Секој ред треба да има статус `OK`.
 5. Ако скриптата побара рестартирање, рестартирајте го компјутерот пред првото поднесување.
-6. Приклучете го токенот и, во обичен PowerShell-прозорец, извршете `.\Fix-TokenIds.ps1 check`. Ако скриптата планира измени, извршете `.\Fix-TokenIds.ps1 apply`.
+6. Приклучете го токенот и, во обичен PowerShell-прозорец во `C:\Tools\scripts`, извршете `.\Fix-TokenIds.ps1 check`. Ако скриптата планира измени, извршете `.\Fix-TokenIds.ps1 apply`.
 
 Опционални параметри:
 

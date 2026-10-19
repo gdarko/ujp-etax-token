@@ -316,7 +316,7 @@ try {
     $checks | Format-Table -AutoSize | Out-String | Write-Host
 
     if ($checks | Where-Object { $_.Status -ne 'OK' }) {
-        Write-Host 'Some checks failed. See the table above and the runbook.' -ForegroundColor Red
+        Write-Host 'Some checks failed. See the table above and docs\troubleshooting.md.' -ForegroundColor Red
     } else {
         Write-Host 'All checks passed.' -ForegroundColor Green
     }
