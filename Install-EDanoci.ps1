@@ -4,20 +4,27 @@
     system (https://etax-fl.ujp.gov.mk) with a KIBSTrust Gemalto/Thales IDPrime token.
 
 .DESCRIPTION
-    Installs and configures, in this order:
+    Installs, in this order:
       1. KIBSTrust SafeNet Authentication Client 10.9-R1 (x64)
       2. Gemalto IDGo 800 PKCS#11 library (x64 package, includes the 32-bit DLL)
-      3. Oracle Java 8, 32-bit (latest from java.com)
-      4. Firefox 52.9.0 ESR, 32-bit, into C:\FF52, with updates removed and locked
-      5. java.security patch (accept the applet's SHA-1 era signature)
-      6. 32-bit IDPrime PKCS#11 library copied to the path the applet hardcodes:
-         C:\Program Files\Gemalto\Classic Client\BIN\gclib.dll
-      7. Per-user Java settings: security level HIGH, exception site, policy grant
-      8. Smart Card service, Firefox profile "edanoci", desktop shortcut
+      3. Oracle Java 8, 32-bit (latest from java.com), auto-update disabled
+      4. Firefox 52.9.0 ESR, 32-bit, into C:\FF52
+
+    Then runs Repair-EDanoci.ps1, which applies the configuration:
+      - Firefox updater removed, updates and plugin blocklist locked
+      - java.security patch (accept the applet's SHA-1 era signature)
+      - 32-bit IDPrime PKCS#11 library copied to the path the applet hardcodes:
+        C:\Program Files\Gemalto\Classic Client\BIN\gclib.dll
+      - Per-user Java settings: security level HIGH, exception site, policy grant
+      - Java auto-update off, Smart Card service on
+
+    Finally creates the Firefox profile "edanoci" and a desktop shortcut, and
+    registers Repair-EDanoci.ps1 as the scheduled task "e-Danoci watchdog"
+    (SYSTEM, at startup and daily), so the configuration is restored if a
+    driver repair or Java update undoes it.
 
     Safe to re-run. Already installed components are skipped, configuration is
-    re-applied. Re-run it after every Java update, because each Java update
-    installs into a new folder with a fresh, unpatched java.security.
+    re-applied. Keep Repair-EDanoci.ps1 in the same folder as this script.
 
     Run from an elevated PowerShell, logged in as the Windows user who will file
     the returns. Per-user settings are written to the profile of the account
@@ -68,17 +75,12 @@ $Src = @{
 }
 
 $FirefoxVersion = '52.9.0'
-$GemaltoBin     = 'C:\Program Files\Gemalto\Classic Client\BIN'   # hardcoded in UJP Signer.jar
-$JavaDeployDir  = Join-Path $env:USERPROFILE 'AppData\LocalLow\Sun\Java\Deployment'
-$PatchMarker    = '# e-Danoci: patched by Install-EDanoci.ps1'
-$JavaSecurityProps = [ordered]@{
-    'jdk.jar.disabledAlgorithms'      = 'MD2'
-    'jdk.certpath.disabledAlgorithms' = 'MD2, RSA keySize < 1024, DSA keySize < 1024'
-}
-$IdPrimeCandidates = @(
+$RepairScript   = Join-Path $PSScriptRoot 'Repair-EDanoci.ps1'
+$DataDir        = 'C:\ProgramData\EDanoci'
+$TaskName       = 'e-Danoci watchdog'
+$IdPrime32Candidates = @(
     'C:\Program Files (x86)\Gemalto\IDGo 800 PKCS#11\IDPrimePKCS11.dll',
-    'C:\Program Files\Gemalto\IDGo 800 PKCS#11\IDPrimePKCS11.dll',
-    'C:\Program Files\SafeNet\Authentication\SAC\x32\IDPrimePKCS11.dll'
+    'C:\Program Files\Gemalto\IDGo 800 PKCS#11\IDPrimePKCS11.dll'
 )
 
 # ---------------------------------------------------------------------------
@@ -97,42 +99,32 @@ function Get-InstalledApp([string]$NamePattern) {
         Where-Object { $_.PSObject.Properties['DisplayName'] -and $_.DisplayName -like $NamePattern }
 }
 
-function Get-PEArch([string]$Path) {
-    $fs = [IO.File]::OpenRead($Path)
-    try {
-        $br = New-Object IO.BinaryReader($fs)
-        [void]$fs.Seek(0x3C, 'Begin')
-        $peOffset = $br.ReadInt32()
-        [void]$fs.Seek($peOffset + 4, 'Begin')
-        switch ($br.ReadUInt16()) {
-            0x014C  { 'x86' }
-            0x8664  { 'x64' }
-            0xAA64  { 'arm64' }
-            default { 'unknown' }
-        }
-    } finally { $fs.Dispose() }
+function Assert-Signature([string]$Path) {
+    $sig = Get-AuthenticodeSignature -LiteralPath $Path
+    if ($sig.Status -ne 'Valid') {
+        Remove-Item -LiteralPath $Path -Force
+        throw "Signature status for $(Split-Path $Path -Leaf) is '$($sig.Status)'. The file was deleted. Check the source."
+    }
+    Write-Info "Signature OK: $($sig.SignerCertificate.Subject)"
 }
 
 function Get-File([string[]]$Urls, [string]$FileName) {
     $dest = Join-Path $WorkDir $FileName
     if ((Test-Path -LiteralPath $dest) -and -not $Force) {
         Write-Info "Using cached $FileName"
+        Assert-Signature $dest
         return $dest
     }
     foreach ($u in $Urls) {
         try {
             Write-Info "Downloading $u"
             Invoke-WebRequest -Uri $u -OutFile $dest -UseBasicParsing
-            $sig = Get-AuthenticodeSignature -LiteralPath $dest
-            if ($sig.Status -eq 'Valid') {
-                Write-Info "Signature OK: $($sig.SignerCertificate.Subject)"
-            } else {
-                Write-Warn2 "Signature status for $FileName is '$($sig.Status)'. Check the source if this is unexpected."
-            }
-            return $dest
         } catch {
             Write-Warn2 "Download failed: $($_.Exception.Message)"
+            continue
         }
+        Assert-Signature $dest
+        return $dest
     }
     throw "Could not download $FileName"
 }
@@ -149,95 +141,9 @@ function Install-Msi([string]$Path, [string]$Name) {
     }
 }
 
-function Get-Jre32Homes {
-    $root = 'C:\Program Files (x86)\Java'
-    if (-not (Test-Path -LiteralPath $root)) { return @() }
-    @(Get-ChildItem -LiteralPath $root -Directory |
-        Where-Object { $_.Name -like 'jre1.8.0_*' -or $_.Name -like 'jre-1.8*' } |
-        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'lib\security\java.security') } |
-        Sort-Object Name | ForEach-Object { $_.FullName })
-}
-
-function Get-JavaSecurityActiveValue([string[]]$Lines, [string]$Key) {
-    $rx = '^\s*' + [regex]::Escape($Key) + '\s*='
-    for ($i = 0; $i -lt $Lines.Count; $i++) {
-        if ($Lines[$i] -match $rx) {
-            $block = $Lines[$i]
-            while ($Lines[$i].TrimEnd().EndsWith('\') -and ($i + 1) -lt $Lines.Count) {
-                $i++
-                $block = $block.TrimEnd().TrimEnd('\') + ' ' + $Lines[$i]
-            }
-            return (($block -replace $rx, '') -replace '\s+', ' ').Trim()
-        }
-    }
-    return $null
-}
-
-function Update-JavaSecurityLines([string[]]$Lines, [string]$Key, [string]$Value) {
-    $rx  = '^\s*' + [regex]::Escape($Key) + '\s*='
-    $out = New-Object System.Collections.Generic.List[string]
-    $done = $false
-    $i = 0
-    while ($i -lt $Lines.Count) {
-        $line = $Lines[$i]
-        if ($line -match $rx) {
-            $out.Add('#' + $line)
-            while ($line.TrimEnd().EndsWith('\') -and ($i + 1) -lt $Lines.Count) {
-                $i++
-                $line = $Lines[$i]
-                $out.Add('#' + $line)
-            }
-            if (-not $done) {
-                $out.Add($PatchMarker)
-                $out.Add("$Key=$Value")
-                $done = $true
-            }
-        } else {
-            $out.Add($line)
-        }
-        $i++
-    }
-    if (-not $done) {
-        $out.Add('')
-        $out.Add($PatchMarker)
-        $out.Add("$Key=$Value")
-    }
-    return ,$out.ToArray()
-}
-
-function Set-JavaSecurity([string]$JreHome) {
-    $file = Join-Path $JreHome 'lib\security\java.security'
-    $enc  = [Text.Encoding]::GetEncoding(28591)   # java.security is ISO-8859-1
-    $lines = [IO.File]::ReadAllLines($file, $enc)
-    $changed = $false
-    foreach ($key in $JavaSecurityProps.Keys) {
-        $want = $JavaSecurityProps[$key]
-        $have = Get-JavaSecurityActiveValue $lines $key
-        if ($have -ne $want) {
-            $lines = Update-JavaSecurityLines $lines $key $want
-            $changed = $true
-        }
-    }
-    if ($changed) {
-        $backup = "$file.orig"
-        if (-not (Test-Path -LiteralPath $backup)) { Copy-Item -LiteralPath $file -Destination $backup }
-        [IO.File]::WriteAllLines($file, $lines, $enc)
-        Write-Info "Patched $file (original kept as java.security.orig)"
-    } else {
-        Write-Info "Already patched: $file"
-    }
-}
-
-function Set-PropertiesFile([string]$Path, [System.Collections.IDictionary]$Pairs) {
-    $lines = @()
-    if (Test-Path -LiteralPath $Path) { $lines = @(Get-Content -LiteralPath $Path) }
-    foreach ($k in $Pairs.Keys) {
-        $rx = '^' + [regex]::Escape($k) + '='
-        $lines = @($lines | Where-Object { $_ -notmatch $rx })
-        $lines += "$k=$($Pairs[$k])"
-    }
-    New-Item -ItemType Directory -Force -Path (Split-Path $Path) | Out-Null
-    Set-Content -LiteralPath $Path -Value $lines -Encoding ASCII
+function Get-Jre32Dirs {
+    @(Get-ChildItem -Path 'C:\Program Files (x86)\Java' -Directory -Filter 'jre*1.8*' -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.FullName })
 }
 
 function Stop-SigningProcesses {
@@ -250,6 +156,7 @@ function Stop-SigningProcesses {
 # Start
 # ---------------------------------------------------------------------------
 if (-not [Environment]::Is64BitOperatingSystem) { throw 'This script targets 64-bit Windows.' }
+if (-not (Test-Path -LiteralPath $RepairScript)) { throw "Repair-EDanoci.ps1 not found next to this script ($PSScriptRoot)." }
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 Start-Transcript -Path (Join-Path $WorkDir 'install.log') -Append | Out-Null
 $script:RebootNeeded = $false
@@ -268,7 +175,7 @@ try {
 
     # 2. IDGo 800 PKCS#11 library -----------------------------------------
     Write-Step 'Gemalto IDGo 800 PKCS#11 library'
-    $haveIdPrime32 = $IdPrimeCandidates[0..1] | Where-Object { Test-Path -LiteralPath $_ }
+    $haveIdPrime32 = $IdPrime32Candidates | Where-Object { Test-Path -LiteralPath $_ }
     if ($haveIdPrime32 -and -not $Force) {
         Write-Info 'Already installed'
     } else {
@@ -277,8 +184,8 @@ try {
 
     # 3. Java 8, 32-bit ---------------------------------------------------
     Write-Step 'Oracle Java 8 (32-bit)'
-    if (@(Get-Jre32Homes).Count -gt 0 -and -not $Force) {
-        Write-Info "Already installed: $((Get-Jre32Homes) -join ', ')"
+    if (@(Get-Jre32Dirs).Count -gt 0 -and -not $Force) {
+        Write-Info "Already installed: $((Get-Jre32Dirs) -join ', ')"
     } else {
         $javaUrl = $Src.JavaFallback
         try {
@@ -293,14 +200,15 @@ try {
             Write-Warn2 "java.com unreachable, using pinned 8u503 link: $($_.Exception.Message)"
         }
         $jre = Get-File @($javaUrl) 'jre8-windows-i586.exe'
-        $jargs = @('/s', 'INSTALL_SILENT=Enable', 'AUTO_UPDATE=Enable', 'WEB_JAVA=Enable',
+        # Auto-update off: an update installs a new JRE with an unpatched java.security
+        $jargs = @('/s', 'INSTALL_SILENT=Enable', 'AUTO_UPDATE=Disable', 'WEB_JAVA=Enable',
                    'WEB_JAVA_SECURITY_LEVEL=H', 'SPONSORS=Disable', 'REBOOT=Disable')
         $p = Start-Process -FilePath $jre -ArgumentList $jargs -Wait -PassThru
         if ($p.ExitCode -ne 0) { throw "Java installer exited with $($p.ExitCode)" }
-        if (@(Get-Jre32Homes).Count -eq 0) {
+        if (@(Get-Jre32Dirs).Count -eq 0) {
             throw 'Java installed, but no 32-bit JRE was found in C:\Program Files (x86)\Java. The download may have been the 64-bit build.'
         }
-        Write-Info "Installed: $((Get-Jre32Homes) -join ', ')"
+        Write-Info "Installed: $((Get-Jre32Dirs) -join ', ')"
     }
 
     # 4. Firefox 52.9.0 ESR ------------------------------------------------
@@ -334,108 +242,18 @@ try {
         Write-Info 'Installed'
     }
 
-    # Lock Firefox before it ever runs
-    Write-Step 'Locking Firefox updates (AutoConfig)'
-    foreach ($f in @('updater.exe', 'updater.ini', 'maintenanceservice.exe', 'maintenanceservice_installer.exe')) {
-        $fp = Join-Path $InstallDir $f
-        if (Test-Path -LiteralPath $fp) { Remove-Item -LiteralPath $fp -Force; Write-Info "Removed $f" }
+    # 5. Configuration, before Firefox ever runs -----------------------------
+    Write-Step 'Configuration (Repair-EDanoci.ps1)'
+    $repairArgs = @{
+        InstallDir      = $InstallDir
+        EtaxUrl         = $EtaxUrl
+        UserProfile     = $env:USERPROFILE
+        EnableJavaDebug = $EnableJavaDebug
     }
-    New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir 'defaults\pref') | Out-Null
-    @(
-        'pref("general.config.filename", "mozilla.cfg");'
-        'pref("general.config.obscure_value", 0);'
-    ) | Set-Content -LiteralPath (Join-Path $InstallDir 'defaults\pref\autoconfig.js') -Encoding ASCII
-    @(
-        '// e-Danoci lockdown. Firefox skips this first line, keep it a comment.'
-        'lockPref("app.update.enabled", false);'
-        'lockPref("app.update.auto", false);'
-        'lockPref("app.update.service.enabled", false);'
-        'lockPref("app.update.url", "");'
-        'lockPref("app.update.url.override", "");'
-        'lockPref("security.enterprise_roots.enabled", true);'
-        'lockPref("plugin.load_flash_only", false);'
-        'lockPref("browser.shell.checkDefaultBrowser", false);'
-        'lockPref("extensions.update.enabled", false);'
-        'lockPref("datareporting.healthreport.uploadEnabled", false);'
-        'lockPref("datareporting.policy.dataSubmissionEnabled", false);'
-        'lockPref("toolkit.telemetry.enabled", false);'
-        "pref(`"browser.startup.homepage`", `"$EtaxUrl`");"
-    ) | Set-Content -LiteralPath (Join-Path $InstallDir 'mozilla.cfg') -Encoding ASCII
-    Write-Info 'autoconfig.js and mozilla.cfg written'
+    $applied = @(& $RepairScript @repairArgs)
+    $applied | Format-Table -AutoSize | Out-String | Write-Host
 
-    # 5. java.security ------------------------------------------------------
-    Write-Step 'Patching java.security in every 32-bit Java 8'
-    foreach ($jh in Get-Jre32Homes) { Set-JavaSecurity $jh }
-
-    # 6. PKCS#11 library at the path Signer.jar expects ------------------------
-    Write-Step "Placing 32-bit IDPrime PKCS#11 library as $GemaltoBin\gclib.dll"
-    $idPrime = $IdPrimeCandidates |
-        Where-Object { (Test-Path -LiteralPath $_) -and (Get-PEArch $_) -eq 'x86' } |
-        Select-Object -First 1
-    if (-not $idPrime) { throw 'No 32-bit IDPrimePKCS11.dll found. Check the SAC and IDGo 800 PKCS#11 installs.' }
-    Write-Info "Source: $idPrime"
-    New-Item -ItemType Directory -Force -Path $GemaltoBin | Out-Null
-    $gclib = Join-Path $GemaltoBin 'gclib.dll'
-    $srcHash = (Get-FileHash -LiteralPath $idPrime).Hash
-    if ((Test-Path -LiteralPath $gclib) -and (Get-FileHash -LiteralPath $gclib).Hash -eq $srcHash) {
-        Write-Info 'Already in place'
-    } else {
-        if (Test-Path -LiteralPath $gclib) {
-            $bak = Join-Path $GemaltoBin ('gclib.dll.bak-{0:yyyyMMdd-HHmmss}' -f (Get-Date))
-            Move-Item -LiteralPath $gclib -Destination $bak
-            Write-Info "Previous gclib.dll moved to $(Split-Path $bak -Leaf)"
-        }
-        Copy-Item -LiteralPath $idPrime -Destination $gclib
-        Write-Info 'Copied'
-    }
-
-    # 7. Per-user Java settings --------------------------------------------
-    Write-Step "Java settings for $env:USERNAME"
-    $props = [ordered]@{
-        'deployment.security.level' = 'HIGH'
-        'deployment.webjava.enabled' = 'true'
-    }
-    if ($EnableJavaDebug) {
-        $props['deployment.trace'] = 'true'
-        $props['deployment.log'] = 'true'
-        $props['deployment.console.startup.mode'] = 'SHOW'
-    }
-    Set-PropertiesFile (Join-Path $JavaDeployDir 'deployment.properties') $props
-    Write-Info 'deployment.properties updated'
-
-    $sites = Join-Path $JavaDeployDir 'security\exception.sites'
-    New-Item -ItemType Directory -Force -Path (Split-Path $sites) | Out-Null
-    $existing = @()
-    if (Test-Path -LiteralPath $sites) { $existing = @(Get-Content -LiteralPath $sites) }
-    if ($existing -notcontains $EtaxUrl) {
-        Add-Content -LiteralPath $sites -Value $EtaxUrl -Encoding ASCII
-        Write-Info "Added $EtaxUrl to exception site list"
-    } else {
-        Write-Info 'Exception site already listed'
-    }
-
-    $policy = @(
-        "grant codeBase `"$EtaxUrl/-`" {"
-        '    permission java.security.AllPermission;'
-        '};'
-    )
-    foreach ($pf in @((Join-Path $env:USERPROFILE '.java.policy'), (Join-Path $JavaDeployDir 'security\java.policy'))) {
-        Set-Content -LiteralPath $pf -Value $policy -Encoding ASCII
-    }
-    Write-Info 'Policy grant written'
-
-    $cache = Join-Path $JavaDeployDir 'cache'
-    if (Test-Path -LiteralPath $cache) {
-        Remove-Item -LiteralPath $cache -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Info 'Java cache cleared'
-    }
-
-    # 8. Smart card service, profile, shortcut --------------------------------
-    Write-Step 'Smart Card service'
-    Set-Service -Name SCardSvr -StartupType Automatic
-    Start-Service -Name SCardSvr -ErrorAction SilentlyContinue
-    Write-Info "SCardSvr: $((Get-Service SCardSvr).Status)"
-
+    # 6. Firefox profile and shortcut ----------------------------------------
     Write-Step "Firefox profile '$ProfileName'"
     $profilesIni = Join-Path $env:APPDATA 'Mozilla\Firefox\profiles.ini'
     $hasProfile = (Test-Path -LiteralPath $profilesIni) -and
@@ -459,33 +277,45 @@ try {
     $sc.Save()
     Write-Info $lnk
 
+    # 7. Watchdog -------------------------------------------------------------
+    Write-Step "Scheduled task '$TaskName'"
+    New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
+    # The task runs as SYSTEM, so only SYSTEM and Administrators may change the script
+    & icacls.exe $DataDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls failed on $DataDir" }
+    $taskScript = Join-Path $DataDir 'Repair-EDanoci.ps1'
+    Copy-Item -LiteralPath $RepairScript -Destination $taskScript -Force
+    $taskArgs = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -InstallDir "{1}" -EtaxUrl "{2}" -UserProfile "{3}"' -f
+        $taskScript, $InstallDir, $EtaxUrl, $env:USERPROFILE
+    $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $taskArgs
+    $triggers  = @(
+        (New-ScheduledTaskTrigger -AtStartup),
+        (New-ScheduledTaskTrigger -Daily -At '07:30')
+    )
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                    -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers -Principal $principal -Settings $settings `
+        -Description "Restores the UJP e-Danoci signing setup. Log: $DataDir\repair.log" -Force | Out-Null
+    Write-Info "Registered: at startup and daily 07:30, as SYSTEM, for $env:USERPROFILE"
+
     # Verification ----------------------------------------------------------
     Write-Step 'Verification'
     $checks = New-Object System.Collections.Generic.List[object]
-    function Add-Check($Name, [bool]$Ok, $Detail) {
-        $checks.Add([pscustomobject]@{ Check = $Name; OK = $(if ($Ok) { 'yes' } else { 'NO' }); Detail = $Detail })
-    }
-    $ffVer = if (Test-Path -LiteralPath $appIni) { ((Get-Content -LiteralPath $appIni) | Where-Object { $_ -like 'Version=*' } | Select-Object -First 1) } else { 'missing' }
-    Add-Check 'Firefox 52.9.0 ESR'    ($ffVer -eq "Version=$FirefoxVersion") $ffVer
-    Add-Check 'Firefox updater removed' (-not (Test-Path -LiteralPath (Join-Path $InstallDir 'updater.exe'))) $InstallDir
-    Add-Check 'Updates locked (mozilla.cfg)' ((Select-String -LiteralPath (Join-Path $InstallDir 'mozilla.cfg') -SimpleMatch 'lockPref("app.update.enabled", false)' -Quiet)) 'mozilla.cfg'
-    $jres = @(Get-Jre32Homes)
-    Add-Check 'Java 8 32-bit' ($jres.Count -gt 0) ($jres -join ', ')
-    foreach ($jh in $jres) {
-        $l = [IO.File]::ReadAllLines((Join-Path $jh 'lib\security\java.security'), [Text.Encoding]::GetEncoding(28591))
-        $ok = $true
-        foreach ($k in $JavaSecurityProps.Keys) { if ((Get-JavaSecurityActiveValue $l $k) -ne $JavaSecurityProps[$k]) { $ok = $false } }
-        Add-Check "java.security patched" $ok (Split-Path $jh -Leaf)
-    }
-    $gArch = if (Test-Path -LiteralPath $gclib) { Get-PEArch $gclib } else { 'missing' }
-    Add-Check 'gclib.dll is 32-bit IDPrime' ($gArch -eq 'x86') $gArch
-    Add-Check 'SafeNet 32-bit PKCS#11' (Test-Path -LiteralPath 'C:\Windows\SysWOW64\eTPKCS11.dll') 'SysWOW64\eTPKCS11.dll'
-    Add-Check 'Smart Card service running' ((Get-Service SCardSvr).Status -eq 'Running') ''
-    Add-Check 'Exception site listed' ((Get-Content -LiteralPath $sites) -contains $EtaxUrl) $EtaxUrl
-    Add-Check 'Desktop shortcut' (Test-Path -LiteralPath $lnk) (Split-Path $lnk -Leaf)
+    foreach ($r in @(& $RepairScript @repairArgs -CheckOnly)) { $checks.Add($r) }
+    $checks.Add([pscustomobject]@{
+        Check  = 'Desktop shortcut'
+        Status = $(if (Test-Path -LiteralPath $lnk) { 'OK' } else { 'FAILED' })
+        Detail = Split-Path $lnk -Leaf
+    })
+    $checks.Add([pscustomobject]@{
+        Check  = 'Watchdog task'
+        Status = $(if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { 'OK' } else { 'FAILED' })
+        Detail = $TaskName
+    })
     $checks | Format-Table -AutoSize | Out-String | Write-Host
 
-    if ($checks | Where-Object { $_.OK -eq 'NO' }) {
+    if ($checks | Where-Object { $_.Status -ne 'OK' }) {
         Write-Host 'Some checks failed. See the table above and the runbook.' -ForegroundColor Red
     } else {
         Write-Host 'All checks passed.' -ForegroundColor Green
@@ -496,8 +326,7 @@ try {
 Next:
   1. Plug in the token.
   2. Open the 'e-Danoci (Firefox 52)' shortcut on the desktop.
-  3. On first use, allow the Java plugin for the site ('Allow and Remember')
-     and accept the Java security prompt for the UJP applet.
+  3. On first use, accept the Java security prompt for the UJP applet.
 "@
 }
 finally {
